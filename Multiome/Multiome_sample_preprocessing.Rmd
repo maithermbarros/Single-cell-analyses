@@ -14,7 +14,7 @@ output:
 editor_options: 
   chunk_output_type: console
 params: 
-  sample_sequencing_id: "Pilot1_GCG_15614_B01_SCR_Lane"
+  sample_sequencing_id: "Sample_1"
   res_dir: "data/results"
   table_dir: "tables"
   fig_dir: "figures"
@@ -64,7 +64,7 @@ knitr::opts_chunk$set(results='asis',
  
 ## Install and load libraries
 ```{r libraries}
-# install.packages("Seurat") # testing V5 out
+# install.packages("Seurat") 
 # remotes::install_github("stuart-lab/signac", ref="develop")
 # install.packages("tidyverse")
 # install.packages("biomaRt")
@@ -76,8 +76,6 @@ knitr::opts_chunk$set(results='asis',
 # BiocManager::install("MACSr"
 # BiocManager::install("Herper")
 # install.packages("devtools")
-# devtools::install_github('cole-trapnell-lab/monocle3')
-# BiocManager::install("monocle")
 # install.packages("clustree")
 
 packages <- c("Seurat","Signac", "here",
@@ -85,7 +83,7 @@ packages <- c("Seurat","Signac", "here",
   "DoubletFinder",
   "clustree", "sceasy",
   "Matrix", "matrixStats",
-  "Herper", "reticulate")
+  "Herper")
 
 purrr::walk(packages, library, character.only = TRUE) 
 
