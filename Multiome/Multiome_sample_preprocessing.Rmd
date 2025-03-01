@@ -1,0 +1,621 @@
+---
+title: "Multiome dataset pre-processing "
+author: "Maithe R. M. de Barros"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float:
+      toc_collapsed: true
+    toc_depth: 3
+    number_sections: false
+    theme: paper
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+params: 
+  sample_sequencing_id: "Pilot1_GCG_15614_B01_SCR_Lane"
+  res_dir: "data/results"
+  table_dir: "tables"
+  fig_dir: "figures"
+  so_dir: "sobjs"
+  metrics: "summary.csv"
+  atac: TRUE
+  data: "/data/Sample1"
+  frags_path: "/cellranger_override/outs/atac_fragments.tsv.gz"
+  barcode_metrics_path: "/cellranger_override/outs/per_barcode_metrics.csv"
+  hto_dir : "/kallisto_bus_out/featurecounts"
+  gex_dir: "/cellranger_override/outs/filtered_feature_bc_matrix"
+  macs2_path: "/home/maithe/miniconda3/envs/macs2/bin/macs2"
+  org: "Ms"
+  assay: "RNA"
+  sample: "Sample1"
+  GEX_sample:
+    - "Sample_1-GEX"
+  HTO_sample:
+    - "Sample_1-HTO"
+  gene_min:     100                     
+  gene_max:     20000                    
+  mito_max:     10
+  min_nCount_peaks: 1000
+  max_nCount_peaks: 100000
+  pct_reads_in_peaks: 15
+  nucleosome_signal: 2
+  tss_enrichment: 1
+  blacklis_ratio: 0.05
+  n_dims_rna: 1:40
+  n_dims_atac: 2:40
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r setup, include=FALSE}
+# Rscript -e "library(rmarkdown); render('Template.Rmd')"
+knitr::opts_chunk$set(results='asis',
+                      fig.align='center',
+                      warning = FALSE,
+                      message = FALSE,
+                      echo = TRUE)
+```
+
+ 
+## Install and load libraries
+```{r libraries}
+# install.packages("Seurat") # testing V5 out
+# remotes::install_github("stuart-lab/signac", ref="develop")
+# install.packages("tidyverse")
+# install.packages("biomaRt")
+# install.packages("Matrix")
+# install.packages("patchwork") 
+# install.packages("BiocManager")
+# BiocManager::install("EnsDb.Mmusculus.v79")
+# BiocManager::install("BSgenome.Mmusculus.UCSC.mm10")
+# BiocManager::install("MACSr"
+# BiocManager::install("Herper")
+# install.packages("devtools")
+# devtools::install_github('cole-trapnell-lab/monocle3')
+# BiocManager::install("monocle")
+# install.packages("clustree")
+
+packages <- c("Seurat","Signac", "here",
+  "cowplot","tidyverse", "patchwork", "ggplot2",
+  "DoubletFinder",
+  "clustree", "sceasy",
+  "Matrix", "matrixStats",
+  "Herper", "reticulate")
+
+purrr::walk(packages, library, character.only = TRUE) 
+
+as.character(packageVersion("Seurat")) # Seurat V4.3. loaded even though V5 is installed because Signac uses Seurat V4
+```
+
+## Set directories and find samples 
+```{r "params"}
+params <- list(
+  data = "/data/Sample1",
+  sample_sequencing_id = "Pilot1_GCG_15614_B01_SCR_Lane",
+  sample = "Sample1",
+  frags_path = "/cellranger_override/outs/atac_fragments.tsv.gz",
+  barcode_metrics_path = "/cellranger_override/outs/per_barcode_metrics.csv",
+  GEX_sample = "Sample_1-GEX",
+  HTO_sample = "Sample_1-HTO",
+  gex_dir = "/cellranger_override/outs/filtered_feature_bc_matrix",
+  hto_dir = "/kallisto_bus_out/featurecounts",
+  res_dir = "/data/Sample1/results",
+  table_dir = "tables",
+  so_dir = "sobjs",
+  fig_dir = "figures",
+  metrics = "summary.csv",
+  org = "Ms",
+  macs2_path = "/home/maithe/miniconda3/envs/macs2/bin/macs2",
+  gene_min = 100,                    
+  gene_max = 20000,                    
+  mito_max = 10,
+  min_nCount_peaks = 1000,
+  max_nCount_peaks = 100000,
+  nucleosome_signal = 2,
+  tss_enrichment = 1,
+  pct_reads_in_peaks = 15,
+  blacklist_fraction = 0.05,
+  n_dims_rna = 1:40,
+  n_dims_atac = 2:40
+)
+
+setwd(here(paste0(params$sample_sequencing_id)))
+```
+
+Use information above to create directories and set up samples 
+```{r "directories and samples"}
+# set path to results folder, seurat objects folder and tables folder 
+res_dir <- here(paste0(params$res_dir))
+so_dir <- here(res_dir, params$so_dir)
+table_dir <- here(res_dir, params$table_dir)
+fig_dir <- here(res_dir, params$fig_dir)
+hto_dir <- params$hto_dir # already determined in the params list
+gex_dir <- params$gex_dir # already determined in the params list
+
+# Create directories if they don't exist
+dir.create(file.path(res_dir), showWarnings = TRUE, recursive = TRUE)
+dir.create(file.path(so_dir), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(table_dir), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(fig_dir), showWarnings = TRUE, recursive = TRUE)
+```
+
+
+## Genomic information
+```{r "atac prep"}
+# Check organism (mouse or human) and load appropriate genomic information
+if (params$org == "Ms") { #if dealing with mouse datasets, get mouse info
+  library(EnsDb.Mmusculus.v79)
+  library(BSgenome.Mmusculus.UCSC.mm10)
+  annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Mmusculus.v79)
+} else { # get human information 
+  library(EnsDb.Hsapiens.v86)
+  library(BSgenome.Hsapiens.UCSC.hg38)
+  annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+}
+
+
+# Rename annotation style
+seqlevelsStyle(annotations) #check annotation style 
+annotations
+seqlevelsStyle(annotations) <- "UCSC" # instead of "NCBI"
+```
+
+## Organism specific parameters 
+Blacklist genes, ribo genes, mt genes, cell cycle genes 
+```{r "mouse gene conversion"}
+# Set parameters based on organism defined in the "params" list
+if (params$org == "Ms") { # for mouse 
+  blacklists <- blacklist_mm10
+  ribo_genes <- c("Gm42418", "AY036118")
+  mt_str <- "^mt-"
+  s.features <- tryCatch(convertHumanGeneList(Seurat::cc.genes.updated.2019$s.genes), error = function(e) {
+    return(str_to_title(Seurat::cc.genes.updated.2019$s.genes))
+  })
+  g2m.features <- tryCatch(convertHumanGeneList(Seurat::cc.genes.updated.2019$g2m.genes), error = function(e) {
+    return(str_to_title(Seurat::cc.genes.updated.2019$g2m.genes))
+  })
+} else { # if not working with mouse, use human info instead
+  blacklists <- blacklist_hg38
+  ribo_genes <- c("Gm42418", "AY036118")
+  mt_str <- "^MT-"
+  s.features <- Seurat::cc.genes.updated.2019$s.genes
+  g2m.features <- Seurat::cc.genes.updated.2019$g2m.genes
+}
+```
+
+## Create Objects and metrics metadata info 
+```{r "create objects"}
+# ---------------------------------- GEX ------------------------------------------
+
+# Create Seurat object with gene expression data
+gex_dir # check which folder data is going to be pulled from
+seurat_raw <- Read10X(data.dir = gex_dir)
+str(seurat_raw)
+seurat <- CreateSeuratObject(seurat_raw$`Gene Expression`, project = params$GEX_sample)
+
+# Add sample origin identity to the object 
+seurat$orig.ident <- params$GEX_sample
+head(Cells(seurat))
+seurat <- RenameCells(seurat, new.names = str_remove(Cells(seurat), ".+_")) # renaming cells to keep just the barcodes 
+
+
+# % MT genes 
+DefaultAssay(seurat) <- "RNA"
+
+seurat <- seurat %>% PercentageFeatureSet(
+  pattern  = mt_str,
+  col.name = "Percent_mito"
+)
+
+# Cell cycle
+seurat <- seurat %>% CellCycleScoring(
+  s.features = s.features,
+  g2m.features = g2m.features,
+  nbin = 15
+)
+
+# % Ribo genes 
+ribo_genes <- intersect(ribo_genes, rownames(seurat@assays[["RNA"]]@counts))
+if (length(ribo_genes) > 0) {
+  seurat$Percent_ribo <- colSums(seurat@assays[["RNA"]]@counts[ribo_genes, ]) / colSums(seurat@assays$RNA@counts) * 100
+}
+
+unique(colnames(seurat@meta.data))
+
+# ----------------------------------- ATAC ----------------------------------------
+
+# 1. 
+# Create fragment file
+frags <- CreateFragmentObject(
+  path = params$frags_path,
+  cells = Cells(seurat)
+)
+
+
+# Create chromatin assay 
+head(colnames(seurat_raw$Peaks))
+colnames(seurat_raw$Peaks) <- str_remove(colnames(seurat_raw$Peaks), ".+_") # renaming cells to keep just the barcodes 
+
+ATAC <- CreateChromatinAssay(
+  counts = seurat_raw$Peaks,
+  sep = c(":", "-"),
+  fragments = frags,
+  annotation = annotations
+)
+
+seurat[["ATAC"]] <- ATAC
+
+# 2. 
+# Read in cellranger metrics
+metrics <- read_csv(params$barcode_metrics_path) %>%
+  column_to_rownames("barcode") %>% # make barcode column as rownames 
+  .[Cells(seurat), ] # subsets the metrics information based on cell barcodes 
+
+max(metrics$is_cell)
+
+# find out the percentage of reads in peaks 
+seurat$peak_region_fragments <- metrics$atac_peak_region_fragments
+seurat$pct_reads_in_peaks <- metrics$atac_peak_region_fragments / metrics$atac_fragments * 100
+
+# blacklist ratio
+seurat$blacklist_fraction <- FractionCountsInRegion(
+  object = seurat,
+  assay = "ATAC",
+  regions = blacklists)
+
+# Nucleosome signal and TSS enrichment 
+DefaultAssay(seurat) <- "ATAC"
+seurat <- NucleosomeSignal(seurat, assay = "ATAC") 
+seurat <- TSSEnrichment(seurat, assay = "ATAC", fast = FALSE) # computes TSS enrichment score for each cell and fast = T to store the results and allow plotting 
+
+
+{
+# 3. 
+# Recall peaks using MACS2
+DefaultAssay(seurat) <- "ATAC"
+
+peaks <- CallPeaks(seurat, 
+                   macs2.path = params$macs2_path,
+                   outdir = res_dir)
+
+# remove peaks on nonstandard chromosomes and in genomic blacklist regions
+peaks <- keepStandardChromosomes(peaks, pruning.mode = "coarse")
+peaks <- subsetByOverlaps(x = peaks, ranges = blacklists, invert = TRUE)
+str(peaks)
+
+# quantify counts in each peak
+macs2_counts <- FeatureMatrix(
+  fragments = Fragments(seurat),
+  features = peaks,
+  cells = colnames(seurat))
+
+
+# create a new assay using the MACS2 peak set and add it to the Seurat object
+seurat[["peaks"]] <- CreateChromatinAssay(
+  counts = macs2_counts,
+  fragments = frags,
+  annotation = annotations)
+
+# SAVE 
+saveRDS(seurat, here(so_dir, paste0(params$sample, "_seurat.rds")))
+
+}
+```
+
+## QC 
+```{r "qc"}
+# orig ident name is too long, create a shorter alternative 
+seurat@meta.data$orig.ident2 <- "Gastric_Pilot-1-GEX"
+
+QC <- VlnPlot(
+  object = seurat,
+  features = c("nCount_RNA","nFeature_RNA", "Percent_mito", "Percent_ribo",  "S.Score", "G2M.Score", "nCount_ATAC", "nFeature_ATAC", "nCount_peaks", "nFeature_peaks", "peak_region_fragments", "TSS.enrichment", "nucleosome_signal", "TSS.enrichment", "nucleosome_signal", "pct_reads_in_peaks", "blacklist_fraction"), group.by = "orig.ident2",
+  pt.size = 0, ncol = 8) + theme(axis.title.x = NULL)
+
+  # Save the plot and RDS 
+ggsave(file.path(fig_dir, paste0(params$sample, "_QC_before_demux_and_filtering.png")), QC, width = 25, height = 15, units = "in")
+
+
+# inspect 
+min(seurat[["nCount_RNA"]])
+max(seurat[["nCount_RNA"]])
+
+min(seurat[["nFeature_RNA"]])
+max(seurat[["nFeature_RNA"]])
+
+sum(seurat[["nFeature_RNA"]] < 500)
+sum(seurat[["nFeature_RNA"]] < 100)
+sum(seurat[["nFeature_RNA"]] > 20000)
+
+sum(seurat[["Percent_mito"]] > 10)
+
+
+max(seurat[["nCount_peaks"]])
+min(seurat[["nCount_peaks"]])
+sum(seurat[["nCount_peaks"]] < 2000)
+sum(seurat[["nCount_peaks"]] < 1000)
+
+sum(seurat[["nCount_peaks"]] > 50000)
+sum(seurat[["nCount_peaks"]] > 100000)
+```
+
+## Filter data and then demultiplex
+```{r "filter-process"}
+# Decide on what to keep -------------------------------------------------------
+seurat$qc <- seurat@meta.data %>%
+  mutate(qc = case_when(
+    Percent_mito > params$mito_max ~ "high_mito_reads",
+    nFeature_RNA > params$gene_max ~ "high_gene_count",
+    nFeature_RNA < params$gene_min ~ "low_gene_count",
+    TRUE ~ "pass"
+)) %>% pull(qc)
+
+seurat$atac_qc <- seurat@meta.data %>%
+  mutate(atac_qc = case_when(
+    nCount_peaks < params$min_nCount_peaks ~ "low_peak",
+    nCount_peaks > params$max_nCount_peaks ~ "high_peak",
+    pct_reads_in_peaks < params$pct_reads_in_peaks ~ "low_peak_pct",
+    nucleosome_signal > params$nucleosome_signal ~ "high_nucleosome",
+    TSS.enrichment < params$tss_enrichment ~ "low_TSS_enrichment",
+    blacklist_fraction > blacklist_fraction ~ "high_blacklist",
+    TRUE ~ "pass"
+    )) %>% pull(atac_qc)
+
+# save raw, unfiltered metadata
+write_csv(as_tibble(seurat@meta.data, rownames = "cell_id"),
+    here(table_dir, paste0(params$sample, "_unfiltered_metadata_QCmetrics.csv")))
+
+# Only work with cells passing basic qc in the RNA assay
+cells_kept <- data.frame(
+  Condition = c("Before_filtering", "RNA_only_filtering", "ATAC_only_filtering", "RNA_and_ATAC_filtering"),
+  Cell_Count = c(length(Cells(seurat)), sum(seurat$qc == "pass"), sum(seurat$atac_qc == "pass"), sum(seurat$qc == "pass" & seurat$atac_qc == "pass"))
+)
+
+write.csv(cells_kept, row.names = FALSE,
+          here(table_dir, paste0(params$sample, "_filtering_comparison.csv")))
+
+
+# Filter using RNA and ATAC metrics --------------------------------------------
+seurat_filt <- subset(seurat,
+                      subset = qc == "pass" & atac_qc == "pass")
+
+# QC again 
+QC2 <- VlnPlot(
+  object = seurat_filt,
+  features = c("nCount_RNA","nFeature_RNA", "Percent_mito", "Percent_ribo",  "S.Score", "G2M.Score", "nCount_ATAC", "nFeature_ATAC", "nCount_peaks", "nFeature_peaks", "peak_region_fragments", "TSS.enrichment", "nucleosome_signal", "TSS.enrichment", "nucleosome_signal", "pct_reads_in_peaks", "blacklist_fraction"),
+  pt.size = 0, ncol = 8, group.by = "orig.ident2") + theme(axis.title.x = NULL)
+
+  # Save the plot
+ggsave(file.path(fig_dir, paste0(params$sample, "_QC_after_filtering_before_demux.png")), QC2, width = 25, height = 15, units = "in")
+
+# DEMULTIPLEXING ----------------------------------------------------------------
+# Access hashing matrix 
+  hto_matrix <- readMM(here(hto_dir, "matrix.mtx"))
+  rownames(hto_matrix) <- readLines(here(hto_dir, "barcodes.tsv")) %>% str_c("-1")
+  colnames(hto_matrix) <- readLines(here(hto_dir, "features.tsv"))
+  colnames(hto_matrix) <- gsub("_", "-", colnames(hto_matrix))
+  hto_matrix <- as.matrix(hto_matrix)
+  
+  
+# create assay using HTO information only for barcodes in the seurat obj
+  hto_assay_filt <- CreateAssayObject(t(hto_matrix[Cells(seurat_filt),]), assay = "HTO_assay")
+  seurat_filt[["HTO"]] <- hto_assay_filt
+  
+  # save hto information
+  write.csv(
+    hto_matrix[Cells(seurat_filt),],
+    here(table_dir, paste0(params$sample, "_HTO_counts_matched_to_RNA_after_filtering.csv"))
+  )
+  
+  # HTO DEMUX -------------------------------------------------------
+  DefaultAssay(seurat_filt) <- "HTO"
+  seurat_filt <- NormalizeData(seurat_filt, assay = "HTO", normalization.method = "CLR")
+  seurat_filt <- HTODemux(seurat_filt, assay = "HTO", positive.quantile = 0.99, nsamples = 100) 
+
+  knitr::kable(table(seurat_filt$HTO_classification.global))
+
+
+# INSPECING RESULTS
+Idents(seurat_filt) <- "HTO_classification.global" 
+
+# To increase the efficiency of plotting, you can subsample cells using the num.cells argument
+hf1 <- HTOHeatmap(seurat_filt, assay = "HTO", ncells = 5000) + theme(plot.title = element_text(face = "bold", hjust = 0.5)) + labs(title = paste0(params$sample, "_HTODemux after filtering")) 
+hf2 <- VlnPlot(seurat_filt, features = "nCount_RNA", pt.size = 0.1, log = TRUE) + theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+Idents(seurat_filt) <- "HTO_classification" 
+hf3 <- VlnPlot(seurat_filt, 
+        idents = c("tag-3", "tag-5", "tag-6", "tag-7","tag-8", "tag-9", "Negative"), 
+        features  = "nCount_RNA", pt.size = 0.1, log = TRUE) 
+
+hf1+hf2+hf3
+ggsave(file.path(fig_dir, paste0(params$sample, "_HTODemux_after_filtering.png")), hf1+hf2+hf3, width = 30, height = 10, units = "in")
+
+
+# Group cells based on the max HTO signal
+Idents(seurat_filt) <- "HTO_maxID"
+rf1 <- RidgePlot(seurat_filt, assay = "HTO", features = rownames(seurat_filt[["HTO"]])[1:4], ncol = 2)
+
+ggsave(file.path(fig_dir, paste0(params$sample, "_HTODemux_enrichment_after_filtering.png")), rf1, width = 30, height = 15, units = "in")
+
+
+```
+
+
+## Keep singlets
+```{r singlets}
+# quickly check hto before filtering obj in the UMAP/clustering before selecting singlets
+DefaultAssay(seurat_filt) <- "HTO"
+check_singlets <- seurat_filt %>%
+  SCTransform() %>% RunPCA() %>% FindNeighbors(reduction = "pca") %>% FindClusters(resolution = 1) %>% RunUMAP(reduction = "pca", dims = 1:40)
+  
+# plot in the UMAP
+DefaultAssay(check_singlets) <- "SCT"
+Idents(check_singlets) <- "SCT_snn_res.1"
+  
+check <- DimPlot(check_singlets, group.by = "HTO_classification.global", shuffle = TRUE)
+ggsave(file.path(fig_dir, paste0(params$sample, "_HTO_after_filtering_classification_UMAP.png")), check, width = 15, height = 10, units = "in")
+
+
+# Extract the singlets LIBNORM -------------------------------------------
+Idents(seurat_filt) <- "HTO_classification.global" 
+
+seurat_singlet <- subset(seurat_filt, idents = "Singlet")
+seurat_singlet
+```
+
+
+## Seurat processing pipeline
+```{r "process-seurat"}
+########################## RNA PROCESSING ######################################
+# RNA Normalization, clustering, etc
+
+DefaultAssay(seurat_singlet) <- "RNA"
+
+seurat_singlet <- seurat_singlet %>% 
+  SCTransform(new.assay.name = "SCT") %>%
+  RunPCA(verbose = FALSE, assay = "SCT", npcs = 50)
+
+e1 <- ElbowPlot(seurat_singlet, ndims = 50, reduction = "pca")
+ggsave(file.path(fig_dir, paste0(params$sample, "_ElbowPlotRNA_singlets.png")), e1, width = 30, height = 15, units = "in")
+
+DefaultAssay(seurat_singlet) <- "SCT"
+seurat_singlet <- seurat_singlet %>% 
+  FindNeighbors(reduction = "pca", dims = params$n_dims_rna) %>%
+  FindClusters(resolution = c(0.2, 0.5, 0.8, 1)) %>%
+  RunUMAP(dims = params$n_dims_rna, slot = "data", reduction.key = "UMAP_", assay = "SCT")
+
+a1 <- DimPlot(seurat_singlet, group.by = "SCT_snn_res.0.2", label = TRUE, pt.size = 1) + labs(title = "Singlets SCT - res.0.2", paste0(params$n_dims_rna, "PCs"))
+a2 <- DimPlot(seurat_singlet, group.by = "SCT_snn_res.0.5", label = TRUE, pt.size = 1) + labs(title = "Singlets SCT - res.0.5", paste0(params$n_dims_rna, "PCs"))
+a3 <- DimPlot(seurat_singlet, group.by = "SCT_snn_res.0.8", label = TRUE, pt.size = 1) + labs(title = "Singlets SCT - res.0.8", paste0(params$n_dims_rna, "PCs"))
+a4 <- DimPlot(seurat_singlet, group.by = "SCT_snn_res.1", label = TRUE, pt.size = 1) + labs(title = "Singlets SCT - res.1", paste0(params$n_dims_rna, "PCs"))
+a1+a2+a3+a4
+ggsave(file.path(fig_dir, paste0(params$sample, "_Singlets_Cluster-Resolutions_SCT-Assay.png")), a1+a2+a3+a4, width = 20, height = 15, units = "in")
+
+
+########################## ATAC PROCESSING ######################################
+
+# calculate ATAC metrics and normalize ATAC
+DefaultAssay(seurat_singlet) <- "peaks"
+
+seurat_singlet <-  seurat_singlet %>%
+  FindTopFeatures(min.cutoff = "q0", assay = "peaks") %>%
+  RunTFIDF(assay = "peaks") %>%
+  RunSVD(assay = "peaks", n = 50) 
+
+# choose how many lsi to keep
+e2 <- ElbowPlot(seurat_singlet, ndims = 50, reduction = "lsi") + 
+  labs(title = "Elbow Plot - Peaks Assay following FindTopFeatures + TFIDF + SVD")
+e2
+ggsave(file.path(fig_dir, paste0(params$sample, "_ElbowPlotPeaks_singlets.png")), e2, width = 30, height = 15, units = "in")
+
+seurat_singlet <- seurat_singlet %>% 
+  FindNeighbors(reduction = "lsi", dims = params$n_dims_atac) %>%
+  FindClusters(resolution = c(0.2, 0.5, 0.8, 1))
+
+seurat_singlet <- RunUMAP(seurat_singlet, 
+                             reduction = 'lsi', 
+                             dims = params$n_dims_atac, 
+                             reduction.name = "umap.peaks", 
+                             reduction.key = "peaksUMAP")
+
+b1 <- DimPlot(seurat_singlet, group.by = "peaks_snn_res.0.2", label = TRUE, pt.size = 1) + labs(title = "Singlets Peaks - res.0.2")
+b2 <- DimPlot(seurat_singlet, group.by = "peaks_snn_res.0.5", label = TRUE, pt.size = 1) + labs(title = "Singlets Peaks - res.0.5")
+b3 <- DimPlot(seurat_singlet, group.by = "peaks_snn_res.0.8", label = TRUE, pt.size = 1) + labs(title = "Singlets Peaks - res.0.8")
+b4 <- DimPlot(seurat_singlet, group.by = "peaks_snn_res.1", label = TRUE, pt.size = 1) + labs(title = "Singlets Peaks - res.1")
+b1+b2+b3+b4
+
+ggsave(file.path(fig_dir, paste0(params$sample, "_Singlets_Cluster-Resolutions_Peaks-Assay.png")), b1+b2+b3+b4, width = 20, height = 15, units = "in")
+
+
+# Score gene activity from Peaks and from SCT 
+{
+gene.activities.peaks <- GeneActivity(seurat_singlet, assay = "peaks", extend.upstream = 2000, extend.downstream = 0, biotypes = "protein_coding")
+
+seurat_singlet[["GApeaks"]] <- CreateAssayObject(counts = gene.activities.peaks)
+seurat_singlet <- NormalizeData(
+  object = seurat_singlet,
+  assay = "GApeaks",
+  scale.factor = median(seurat_singlet$nCount_GApeaks))
+
+saveRDS(seurat_singlet,
+        here(so_dir, paste0(params$sample, "_seurat_singlets_RNA_ATAC_processed.RDS"))) }
+```
+
+Check clustering resolution 
+```{r "clustree"}
+# for deciding on resolution parameter of clustering
+c1 <- clustree(seurat_singlet, prefix = paste0("SCT_snn_res."), prop_filter = 0.3)
+c1
+ggsave(file.path(fig_dir, paste0(params$sample, "_Singlets_Clustree_SCT-Assay.png")), c1, width = 20, height = 15, units = "in")
+
+c2 <- clustree(seurat_singlet, prefix = paste0("peaks_snn_res."), prop_filter = 0.3)
+c2
+ggsave(file.path(fig_dir, paste0(params$sample, "_Singlets_Clustree_Peaks-Assay.png")), c2, width = 20, height = 15, units = "in")
+```
+
+
+# WNN joing UMAP (RNA + ATAC)
+``` {r WNN}
+# Joint UMAP
+{
+DefaultAssay(seurat_singlet) <- "SCT"
+
+multiome_singlet <- FindMultiModalNeighbors(
+  object = seurat_singlet,
+  reduction.list = list("pca", "lsi"),
+  dims.list = list(params$n_dims_rna, params$n_dims_atac),
+  verbose = TRUE)
+
+multiome_singlet <- RunUMAP(
+  object = multiome_singlet,
+  nn.name = "weighted.nn",
+  verbose = TRUE, 
+  reduction.name = "jointumap",
+  reduction.key = "jointUMAP_")
+
+Graphs(multiome_singlet)
+multiome_singlet <- FindClusters(
+  multiome_singlet, 
+  graph.name = "wsnn", 
+  algorithm = 3, verbose = FALSE, resolution = c(0.2, 0.5, 0.8, 1))
+
+
+Reductions(multiome_singlet)
+
+p1 <- DimPlot(multiome_singlet, reduction = 'jointumap', group.by = "wsnn_res.0.2", label = TRUE, pt.size = 1) + labs(title = "WNN - res.0.2")
+p2 <- DimPlot(multiome_singlet, reduction = 'jointumap', group.by = "wsnn_res.0.5", label = TRUE, pt.size = 1) + labs(title = "WNN - res.0.5")
+p3 <- DimPlot(multiome_singlet, reduction = 'jointumap', group.by = "wsnn_res.0.8", label = TRUE, pt.size = 1) + labs(title = "WNN- res.0.8")
+p4 <- DimPlot(multiome_singlet, reduction = 'jointumap', group.by = "wsnn_res.1", label = TRUE, pt.size = 1) + labs(title = "WNN - res.1")
+p1 + p2 + p3 + p4
+
+ggsave(file.path(fig_dir, paste0(params$sample, "_Singlets_Cluster-Resolutions_WNN-Assay.png")), p1+p2+p3+p4, width = 20, height = 15, units = "in")
+
+# Save raw meta and final object
+meta_wnn <- as_tibble(multiome_singlet@meta.data, rownames = "cell_id")
+
+write_csv(
+  meta_wnn,
+  here(table_dir, paste0(params$sample, "_singlets_WNN_metadata.csv")))
+
+saveRDS(
+  multiome_singlet,
+  here(so_dir, paste0(params$sample, "_seurat_singlets_WNNmultiome.rds")))
+
+}
+```
+
+
+# End matter
+To finish get session info: 
+
+```{r Endnote, echo=FALSE}
+sessionInfo()
+```
+
+
+
